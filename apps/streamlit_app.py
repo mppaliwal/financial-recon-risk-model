@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import tempfile
 from pathlib import Path
 
@@ -14,9 +15,17 @@ from recon_risk.contracts import (
     schema_gaps,
 )
 from recon_risk.logging_utils import setup_logging
+from recon_risk.modeling import RiskModelFactory
 from recon_risk.service import score_dataframe
 
 setup_logging()
+
+APP_MODE = os.getenv("APP_MODE", "admin").strip().lower()
+if APP_MODE not in {"admin", "ops"}:
+    APP_MODE = "admin"
+CHAMPION_MODEL_NAME = os.getenv("CHAMPION_MODEL_NAME", "logistic_regression").strip().lower()
+if CHAMPION_MODEL_NAME not in RiskModelFactory.supported_models():
+    CHAMPION_MODEL_NAME = "logistic_regression"
 
 
 st.set_page_config(
@@ -64,138 +73,158 @@ st.markdown(
 
 with st.sidebar:
     st.subheader("Run Settings")
-    top_k_frac = st.slider("Top-k Threshold Fraction", min_value=0.01, max_value=0.50, value=0.10, step=0.01)
+    if APP_MODE == "admin":
+        model_name = st.selectbox(
+            "Model",
+            options=RiskModelFactory.supported_models(),
+            index=0,
+            help="Choose baseline or challenger model for training.",
+        )
+        top_k_frac = st.slider(
+            "Top-k Threshold Fraction", min_value=0.01, max_value=0.50, value=0.10, step=0.01
+        )
+    else:
+        model_name = CHAMPION_MODEL_NAME
+        top_k_frac = 0.10
+        st.info(f"Ops mode enabled. Champion model: `{model_name}`")
     data_out = st.text_input("Processed Data Folder", value="data")
     report_out = st.text_input("Report Folder", value="reports")
     model_out = st.text_input("Model Folder", value="artifacts")
 
-tabs = st.tabs(["Train Model", "Score Breaks", "Run Summary"])
+if APP_MODE == "admin":
+    tabs = st.tabs(["Train Model", "Score Breaks", "Run Summary"])
+    train_tab, score_tab, summary_tab = tabs
+else:
+    tabs = st.tabs(["Score Breaks"])
+    score_tab = tabs[0]
 
-with tabs[0]:
-    st.markdown("#### Upload training CSV")
-    train_file = st.file_uploader(
-        "Training dataset",
-        type=["csv"],
-        key="train_csv",
-        help="Must include `resolution_via` for deterministic labeling.",
-    )
-
-    if train_file is not None:
-        df_train = pd.read_csv(train_file)
-        gaps = schema_gaps(
-            df_train,
-            hard_required=HARD_REQUIRED_COLUMNS_TRAIN,
-            optional=OPTIONAL_MODEL_COLUMNS,
+if APP_MODE == "admin":
+    with train_tab:
+        st.markdown("#### Upload training CSV")
+        train_file = st.file_uploader(
+            "Training dataset",
+            type=["csv"],
+            key="train_csv",
+            help="Must include `resolution_via` for deterministic labeling.",
         )
-        hard_miss = gaps["hard_missing"]
-        optional_miss = gaps["optional_missing"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Rows", f"{len(df_train):,}")
-        c2.metric("Columns", f"{len(df_train.columns):,}")
-        c3.metric("Missing Hard-Required", len(hard_miss))
 
-        if hard_miss:
-            st.error("Missing hard-required columns: " + ", ".join(hard_miss))
-        else:
-            st.success("Schema check passed.")
-            if optional_miss:
-                st.warning(
-                    "Optional model columns missing (defaults will be applied): "
-                    + ", ".join(optional_miss)
-                )
+        if train_file is not None:
+            df_train = pd.read_csv(train_file)
+            gaps = schema_gaps(
+                df_train,
+                hard_required=HARD_REQUIRED_COLUMNS_TRAIN,
+                optional=OPTIONAL_MODEL_COLUMNS,
+            )
+            hard_miss = gaps["hard_missing"]
+            optional_miss = gaps["optional_missing"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Rows", f"{len(df_train):,}")
+            c2.metric("Columns", f"{len(df_train.columns):,}")
+            c3.metric("Missing Hard-Required", len(hard_miss))
 
-        with st.expander("Preview Data", expanded=False):
-            st.dataframe(df_train.head(30), use_container_width=True)
+            if hard_miss:
+                st.error("Missing hard-required columns: " + ", ".join(hard_miss))
+            else:
+                st.success("Schema check passed.")
+                if optional_miss:
+                    st.warning(
+                        "Optional model columns missing (defaults will be applied): "
+                        + ", ".join(optional_miss)
+                    )
 
-        if st.button("Train Model", type="primary", disabled=bool(hard_miss)):
-            with st.spinner("Training pipeline running..."):
-                with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tf:
-                    df_train.to_csv(tf.name, index=False)
-                    input_path = tf.name
+            with st.expander("Preview Data", expanded=False):
+                st.dataframe(df_train.head(30), use_container_width=True)
 
-                summary = run_training_from_csv(
-                    input_csv=input_path,
-                    training_config=TrainingConfig(top_k_frac=top_k_frac),
-                    paths_config=PathsConfig(
-                        data_out=Path(data_out),
-                        report_out=Path(report_out),
-                        model_out=Path(model_out),
-                    ),
-                )
-                st.session_state["train_summary"] = summary
+            if st.button("Train Model", type="primary", disabled=bool(hard_miss)):
+                with st.spinner("Training pipeline running..."):
+                    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tf:
+                        df_train.to_csv(tf.name, index=False)
+                        input_path = tf.name
 
-            st.success("Training completed.")
-    train_summary = st.session_state.get("train_summary")
-    if train_summary:
-        tm = train_summary.get("test_metrics", {})
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("PR-AUC", f"{tm.get('pr_auc', 0):.4f}")
-        m2.metric("ROC-AUC", f"{tm.get('roc_auc', 0):.4f}")
-        m3.metric("Precision", f"{tm.get('precision', 0):.4f}")
-        m4.metric("Recall", f"{tm.get('recall', 0):.4f}")
+                    summary = run_training_from_csv(
+                        input_csv=input_path,
+                        training_config=TrainingConfig(model_name=model_name, top_k_frac=top_k_frac),
+                        paths_config=PathsConfig(
+                            data_out=Path(data_out),
+                            report_out=Path(report_out),
+                            model_out=Path(model_out),
+                        ),
+                    )
+                    st.session_state["train_summary"] = summary
 
-        st.markdown("#### Run Diagnostics")
-        ingestion = train_summary.get("ingestion_report", {})
-        timings = train_summary.get("timings_sec", {})
-        coll = train_summary.get("collinearity_checks", {})
+                st.success("Training completed.")
+        train_summary = st.session_state.get("train_summary")
+        if train_summary:
+            tm = train_summary.get("test_metrics", {})
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("PR-AUC", f"{tm.get('pr_auc', 0):.4f}")
+            m2.metric("ROC-AUC", f"{tm.get('roc_auc', 0):.4f}")
+            m3.metric("Precision", f"{tm.get('precision', 0):.4f}")
+            m4.metric("Recall", f"{tm.get('recall', 0):.4f}")
 
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Ingest Rows", f"{ingestion.get('row_count', 0):,}")
-        d2.metric("Ingest Cols", f"{ingestion.get('column_count', 0):,}")
-        d3.metric("Hard Missing", len(ingestion.get("missing_hard_required", [])))
-        d4.metric("Optional Missing", len(ingestion.get("missing_optional", [])))
+            st.markdown("#### Run Diagnostics")
+            ingestion = train_summary.get("ingestion_report", {})
+            timings = train_summary.get("timings_sec", {})
+            coll = train_summary.get("collinearity_checks", {})
 
-        t1, t2, t3, t4, t5 = st.columns(5)
-        t1.metric("Ingestion (s)", f"{timings.get('ingestion_sec', 0):.3f}")
-        t2.metric("Preprocess (s)", f"{timings.get('preprocess_sec', 0):.3f}")
-        t3.metric("Train+Eval (s)", f"{timings.get('train_eval_sec', 0):.3f}")
-        t4.metric("Save (s)", f"{timings.get('artifact_save_sec', 0):.3f}")
-        t5.metric("Total (s)", f"{timings.get('total_sec', 0):.3f}")
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Ingest Rows", f"{ingestion.get('row_count', 0):,}")
+            d2.metric("Ingest Cols", f"{ingestion.get('column_count', 0):,}")
+            d3.metric("Hard Missing", len(ingestion.get("missing_hard_required", [])))
+            d4.metric("Optional Missing", len(ingestion.get("missing_optional", [])))
 
-        high_corr = coll.get("high_correlation_pairs", [])
-        high_vif = coll.get("high_vif_features", [])
-        c1, c2 = st.columns(2)
-        c1.metric("High Corr Pairs", len(high_corr))
-        c2.metric("High VIF Features", len(high_vif))
+            t1, t2, t3, t4, t5 = st.columns(5)
+            t1.metric("Ingestion (s)", f"{timings.get('ingestion_sec', 0):.3f}")
+            t2.metric("Preprocess (s)", f"{timings.get('preprocess_sec', 0):.3f}")
+            t3.metric("Train+Eval (s)", f"{timings.get('train_eval_sec', 0):.3f}")
+            t4.metric("Save (s)", f"{timings.get('artifact_save_sec', 0):.3f}")
+            t5.metric("Total (s)", f"{timings.get('total_sec', 0):.3f}")
 
-        with st.expander("Collinearity Details", expanded=False):
-            st.write("High correlation pairs (|corr| >= threshold)")
-            st.dataframe(pd.DataFrame(high_corr), use_container_width=True)
-            st.write("High VIF features (>= threshold)")
-            st.dataframe(pd.DataFrame(high_vif), use_container_width=True)
+            high_corr = coll.get("high_correlation_pairs", [])
+            high_vif = coll.get("high_vif_features", [])
+            c1, c2 = st.columns(2)
+            c1.metric("High Corr Pairs", len(high_corr))
+            c2.metric("High VIF Features", len(high_vif))
 
-        st.markdown("#### Download Artifacts")
-        for label, key in [
-            ("Processed CSV", "dataset_path"),
-            ("EDA Summary", "eda_path"),
-            ("Metrics JSON", "metrics_path"),
-            ("Threshold JSON", "threshold_path"),
-            ("Baseline Config", "baseline_config_path"),
-            ("Run Metadata", "run_metadata_path"),
-            ("Model PKL", "model_path"),
-        ]:
-            path = train_summary.get(key)
-            if path and Path(path).exists():
-                mode = "rb" if path.endswith(".pkl") else "r"
-                with open(path, mode) as f:
-                    data = f.read()
-                st.download_button(
-                    label=f"Download {label}",
-                    data=data,
-                    file_name=Path(path).name,
-                    mime="application/octet-stream" if path.endswith(".pkl") else "text/plain",
-                    key=f"dl_{key}",
-                )
+            with st.expander("Collinearity Details", expanded=False):
+                st.write("High correlation pairs (|corr| >= threshold)")
+                st.dataframe(pd.DataFrame(high_corr), use_container_width=True)
+                st.write("High VIF features (>= threshold)")
+                st.dataframe(pd.DataFrame(high_vif), use_container_width=True)
 
-with tabs[1]:
+            st.markdown("#### Download Artifacts")
+            for label, key in [
+                ("Processed CSV", "dataset_path"),
+                ("EDA Summary", "eda_path"),
+                ("Metrics JSON", "metrics_path"),
+                ("Threshold JSON", "threshold_path"),
+                ("Baseline Config", "baseline_config_path"),
+                ("Run Metadata", "run_metadata_path"),
+                ("Model Comparison", "model_comparison_path"),
+                ("Model PKL", "model_path"),
+            ]:
+                path = train_summary.get(key)
+                if path and Path(path).exists():
+                    mode = "rb" if path.endswith(".pkl") else "r"
+                    with open(path, mode) as f:
+                        data = f.read()
+                    st.download_button(
+                        label=f"Download {label}",
+                        data=data,
+                        file_name=Path(path).name,
+                        mime="application/octet-stream" if path.endswith(".pkl") else "text/plain",
+                        key=f"dl_{key}",
+                    )
+
+with score_tab:
     st.markdown("#### Upload scoring CSV")
     score_file = st.file_uploader("Scoring dataset", type=["csv"], key="score_csv")
     st.markdown('<p class="muted">Use existing model artifacts or upload your own model + threshold files.</p>', unsafe_allow_html=True)
 
     source = st.radio("Model Source", ["Use Artifacts Folder", "Upload Files"], horizontal=True)
 
-    model_path_input = Path(model_out) / "risk_model.pkl"
-    threshold_path_input = Path(model_out) / "threshold.json"
+    model_path_input = Path(model_out) / model_name / "risk_model.pkl"
+    threshold_path_input = Path(model_out) / model_name / "threshold.json"
 
     model_path = None
     threshold_path = None
@@ -279,19 +308,20 @@ with tabs[1]:
             mime="text/csv",
         )
 
-with tabs[2]:
-    st.markdown("#### Latest Run Details")
-    train_summary = st.session_state.get("train_summary")
-    score_summary = st.session_state.get("score_summary")
+if APP_MODE == "admin":
+    with summary_tab:
+        st.markdown("#### Latest Run Details")
+        train_summary = st.session_state.get("train_summary")
+        score_summary = st.session_state.get("score_summary")
 
-    if train_summary:
-        st.markdown("##### Training Summary")
-        st.json(train_summary)
-    else:
-        st.info("No training run in this session yet.")
+        if train_summary:
+            st.markdown("##### Training Summary")
+            st.json(train_summary)
+        else:
+            st.info("No training run in this session yet.")
 
-    if score_summary:
-        st.markdown("##### Scoring Summary")
-        st.json(score_summary)
-    else:
-        st.info("No scoring run in this session yet.")
+        if score_summary:
+            st.markdown("##### Scoring Summary")
+            st.json(score_summary)
+        else:
+            st.info("No scoring run in this session yet.")

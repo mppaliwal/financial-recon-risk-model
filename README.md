@@ -17,7 +17,7 @@ For an end-to-end flow diagram (Train + Score paths), see:
 2. Preprocesses/cleans the data and creates leakage-safe engineered features.
 3. Builds deterministic labels from `resolution_via`.
 4. Splits data by `deal_id` with chronological ordering to avoid leakage.
-5. Trains a baseline risk model (Logistic Regression with mixed tabular + text features).
+5. Trains a risk model (Logistic Regression baseline or XGBoost challenger) with mixed tabular + text features.
 6. Evaluates model performance and selects an operating threshold (top-k capacity style).
 7. Saves processed data, EDA summary, model, metrics, and threshold artifacts.
 
@@ -124,8 +124,10 @@ This simulates forward-looking deployment and prevents leakage from repeated dea
 
 ## Model and Features
 
-Baseline model:
-- Logistic Regression (`class_weight="balanced"`, solver `saga`)
+Supported models:
+- `logistic_regression` (baseline)
+- `xgboost` (challenger)
+- `random_forest` (challenger)
 
 Feature families:
 - Categorical: deal/product/ops context fields
@@ -157,6 +159,16 @@ python scripts/run_training.py
 python -m streamlit run apps/streamlit_app.py
 ```
 
+Role-based app modes:
+
+```bash
+# Admin / DS mode (train + score + run summary)
+APP_MODE=admin python -m streamlit run apps/streamlit_app.py
+
+# Ops mode (score-only UI, champion model locked)
+APP_MODE=ops CHAMPION_MODEL_NAME=logistic_regression python -m streamlit run apps/streamlit_app.py
+```
+
 UI capabilities:
 - Train from uploaded CSV
 - Validate required schema
@@ -183,13 +195,25 @@ from recon_risk.config import PathsConfig, TrainingConfig
 
 summary = run_training_from_csv(
     input_csv="data/breaks.csv",
-    training_config=TrainingConfig(top_k_frac=0.10),
+    training_config=TrainingConfig(model_name="xgboost", top_k_frac=0.10),
     paths_config=PathsConfig(
         data_out=Path("data"),
         report_out=Path("reports"),
         model_out=Path("artifacts"),
     ),
 )
+```
+
+Script model selection:
+
+```bash
+RECON_MODEL_NAME=xgboost python scripts/run_training.py path/to/breaks.csv
+```
+
+If `xgboost` is missing in your environment:
+
+```bash
+pip install xgboost
 ```
 
 ## Outputs
@@ -202,20 +226,24 @@ After a successful run:
 - `reports/eda_summary.json`
   - High-level EDA snapshot (counts, label availability, distributions, null profile).
 
-- `artifacts/risk_model.pkl`
+- `artifacts/<model_name>/risk_model.pkl`
   - Trained sklearn pipeline (preprocessing + model).
 
-- `artifacts/metrics.json`
+- `artifacts/<model_name>/metrics.json`
   - Validation/test metrics, top-k operating-point reports, and collinearity checks.
 
-- `artifacts/threshold.json`
+- `artifacts/<model_name>/threshold.json`
   - Saved top-10% threshold for scoring workflows.
 
-- `artifacts/baseline_config.json`
+- `artifacts/<model_name>/baseline_config.json`
   - Frozen baseline training policy and feature spec snapshot for fair champion/challenger comparison.
 
-- `artifacts/run_metadata.json`
+- `artifacts/<model_name>/run_metadata.json`
   - Run timestamp, input source, known/unknown label counts, and git commit hash (if available).
+
+- `artifacts/model_comparison.json`
+  - Auto-ranked champion/challenger summary using promotion rule:
+    guardrail pass, then precision@top-k, then PR-AUC, then ROC-AUC.
 
 - `logs/recon_risk.log`
   - Stage-level application logs (ingestion, preprocess, train/eval, scoring, persistence).
@@ -229,7 +257,7 @@ After a successful run:
 
 ## Typical Next Steps
 
-1. Replace Logistic Regression with challenger models (XGBoost/LightGBM/CatBoost).
+1. Compare champion/challenger runs (`logistic_regression` vs `xgboost`) using identical split/policy settings.
 2. Add model selection logic based on your business objective (for example precision@top-k).
 3. Add scoring service method (`score_dataframe`) for frontend upload flows.
 4. Add explainability layer (feature importance / SHAP) for operational review.

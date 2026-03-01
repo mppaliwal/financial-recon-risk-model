@@ -26,6 +26,11 @@ class ArtifactStore:
         df.to_csv(out, index=False)
         return out
 
+    def _model_dir(self, model_name: str) -> Path:
+        model_dir = self.paths.model_out / model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return model_dir
+
     def save_eda(self, df: pd.DataFrame) -> Path:
         known = df[df["label_status"] == "known"]
         payload = {
@@ -45,10 +50,18 @@ class ArtifactStore:
             json.dump(payload, f, indent=2)
         return out
 
-    def save_model_bundle(self, model: Pipeline, metrics: Dict[str, object], threshold: float) -> Dict[str, Path]:
-        model_path = self.paths.model_out / "risk_model.pkl"
-        metrics_path = self.paths.model_out / "metrics.json"
-        threshold_path = self.paths.model_out / "threshold.json"
+    def save_model_bundle(
+        self,
+        model: Pipeline,
+        metrics: Dict[str, object],
+        threshold: float,
+        *,
+        model_name: str,
+    ) -> Dict[str, Path]:
+        model_dir = self._model_dir(model_name)
+        model_path = model_dir / "risk_model.pkl"
+        metrics_path = model_dir / "metrics.json"
+        threshold_path = model_dir / "threshold.json"
 
         with open(model_path, "wb") as f:
             pickle.dump(model, f)
@@ -69,11 +82,13 @@ class ArtifactStore:
         training_config: TrainingConfig,
         feature_spec: Dict[str, object],
     ) -> Path:
-        out = self.paths.model_out / "baseline_config.json"
+        model_dir = self._model_dir(training_config.model_name)
+        out = model_dir / "baseline_config.json"
         payload = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "model_family": "logistic_regression",
+            "model_family": training_config.model_name,
             "training_config": {
+                "model_name": training_config.model_name,
                 "top_k_frac": float(training_config.top_k_frac),
                 "split_train": float(training_config.split_train),
                 "split_val": float(training_config.split_val),
@@ -95,15 +110,71 @@ class ArtifactStore:
         known_rows: int,
         unknown_rows: int,
         git_commit: str,
+        model_name: str,
     ) -> Path:
-        out = self.paths.model_out / "run_metadata.json"
+        model_dir = self._model_dir(model_name)
+        out = model_dir / "run_metadata.json"
         payload = {
             "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "input_csv": str(input_csv),
+            "model_name": model_name,
             "row_count": int(row_count),
             "known_label_rows": int(known_rows),
             "unknown_label_rows": int(unknown_rows),
             "git_commit": git_commit,
+        }
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return out
+
+    def save_model_comparison(self) -> Path:
+        out = self.paths.model_out / "model_comparison.json"
+
+        def _score_key(item: Dict[str, object]) -> tuple:
+            tm = item.get("test_metrics", {})
+            recall_pass = bool(item.get("recall_guardrail_pass", False))
+            return (
+                1 if recall_pass else 0,
+                float(tm.get("precision", 0.0)),
+                float(tm.get("pr_auc", 0.0)),
+                float(tm.get("roc_auc", 0.0)),
+            )
+
+        models: list[Dict[str, object]] = []
+        for model_dir in sorted(self.paths.model_out.iterdir()) if self.paths.model_out.exists() else []:
+            if not model_dir.is_dir():
+                continue
+            metrics_path = model_dir / "metrics.json"
+            if not metrics_path.exists():
+                continue
+            with open(metrics_path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+            policy = metrics.get("promotion_policy", {})
+            check = metrics.get("promotion_check", {})
+            models.append(
+                {
+                    "model_name": model_dir.name,
+                    "metrics_path": str(metrics_path),
+                    "promotion_policy": policy,
+                    "test_metrics": metrics.get("test_metrics", {}),
+                    "recall_guardrail_pass": bool(check.get("recall_guardrail_pass", False)),
+                }
+            )
+
+        ranked = sorted(models, key=_score_key, reverse=True)
+        champion = ranked[0] if ranked else None
+        payload = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ranking_rule": {
+                "order": [
+                    "recall_guardrail_pass",
+                    "test_metrics.precision",
+                    "test_metrics.pr_auc",
+                    "test_metrics.roc_auc",
+                ]
+            },
+            "champion": champion,
+            "models": ranked,
         }
         with open(out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)

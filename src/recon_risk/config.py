@@ -30,6 +30,7 @@ class ResolutionConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    model_name: str = "logistic_regression"
     top_k_frac: float = 0.10
     split_train: float = 0.70
     split_val: float = 0.15
