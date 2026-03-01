@@ -1,55 +1,10 @@
-# Recon Break Risk Scoring Pipeline
+# Recon Break Risk Scoring
 
-This repository contains a training pipeline for **Financial Reconciliation Break Risk Analysis**.
-It trains a model that predicts whether a raised break is likely to become **material/high-risk**,
-using only information available at the time the break is raised.
+Predicts which reconciliation breaks are likely to become high-risk/material, using only data available when the break is raised.
 
-The code is organized for programmatic use (for example from a future Streamlit app), not CLI flags.
+For detailed flow diagrams, see `docs/flow_visualization.md`.
 
-## Visual Flow
-
-For an end-to-end flow diagram (Train + Score paths), see:
-- `docs/flow_visualization.md`
-
-## What This Pipeline Does
-
-1. Loads a break-level CSV dataset.
-2. Preprocesses/cleans the data and creates leakage-safe engineered features.
-3. Builds deterministic labels from `resolution_via`.
-4. Splits data by `deal_id` with chronological ordering to avoid leakage.
-5. Trains a risk model (Logistic Regression baseline or XGBoost challenger) with mixed tabular + text features.
-6. Evaluates model performance and selects an operating threshold (top-k capacity style).
-7. Saves processed data, EDA summary, model, metrics, and threshold artifacts.
-
-## Production-Grade Core Additions
-
-- **Pydantic input contract validation**:
-  - `src/recon_risk/contracts.py`
-  - `src/recon_risk/ingestion.py`
-  - validates training input path and schema before preprocessing starts.
-
-- **Structured logging**:
-  - `src/recon_risk/logging_utils.py`
-  - stage-level logs for ingestion, preprocessing, training/evaluation, scoring, and artifact persistence.
-  - default log file: `logs/recon_risk.log`
-
-- **Training run metadata**:
-  - training response includes `ingestion_report` and stage `timings_sec`.
-
-## Repository Structure
-
-- `src/recon_risk/`: Core package (domain, preprocessing, model, pipeline, service utilities)
-- `src/recon_risk/contracts.py`: Pydantic request + schema contracts (hard-required/optional fields)
-- `src/recon_risk/ingestion.py`: Input CSV loading + contract validation
-- `src/recon_risk/logging_utils.py`: Central logging setup
-- `src/recon_risk/diagnostics.py`: Collinearity diagnostics (correlation + VIF-style)
-- `apps/streamlit_app.py`: Main Streamlit application UI
-- `scripts/run_training.py`: Script entrypoint for training from CSV
-- `data/`, `reports/`, `artifacts/`: Runtime outputs
-- `tests/`: Placeholder for unit/integration tests
-- `pyproject.toml`: Package metadata and `src` layout config
-
-## Installation
+## 1) Quick Start
 
 ```bash
 python -m venv .venv
@@ -58,11 +13,11 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-## Required Input Data
+## 2) Input Data Contract
 
-Each row should represent one break.
+Each row = one break.
 
-Hard-required columns (run is blocked if missing):
+### Required for training
 - `deal_id`
 - `deal_type`
 - `template`
@@ -72,9 +27,12 @@ Hard-required columns (run is blocked if missing):
 - `raised_on`
 - `review_due`
 - `query_comments`
-- `resolution_via` (training only, used for deterministic labeling)
+- `resolution_via`
 
-Optional model columns (allowed missing; defaults are applied and shown in UI warnings):
+### Required for scoring
+- Same as above, except `resolution_via` is not required.
+
+### Optional model fields
 - `asset_class`
 - `product_type`
 - `desk`
@@ -83,197 +41,108 @@ Optional model columns (allowed missing; defaults are applied and shown in UI wa
 - `legal_entity`
 - `booking_entity`
 - `notional_bucket`
+- `is_new_trade`
 - `confirm_status_at_raise`
 - `confirm_age_hours`
 - `ops_queue`
 - `field_count_mismatch`
 
-`resolution_date` is optional traceability metadata and not used as a model feature.
+Missing optional fields are defaulted during preprocessing.
 
-## Labeling Logic
+## 3) Labeling (Deterministic)
 
-Target `y` is deterministic from `resolution_via`:
+Target `y` is derived from `resolution_via`:
 
-- `y = 1` for high-risk outcomes:
-  - `cpf amend`
-  - `tx amend`
-  - `warforge amend`
-  - `termsheet amend`
-  - `risk amend`
-  - `deal closure`
-  - `de escalated`
+- High-risk (`y=1`): `cpf amend`, `tx amend`, `warforge amend`, `termsheet amend`, `risk amend`, `deal closure`, `de escalated`
+- Low-risk (`y=0`): `confirmation amend`, `system limitaion`, `legacy closure`, `signed off`
+- Anything else: unknown label (excluded from supervised train/eval)
 
-- `y = 0` for low-risk outcomes:
-  - `confirmation amend`
-  - `system limitaion`
-  - `legacy closure`
-  - `signed off`
+## 4) Training and Model Selection
 
-Rows with any other `resolution_via` are treated as `unknown` labels and excluded from supervised training/evaluation.
+- Split: grouped by `deal_id`, chronological by earliest `raised_on`
+- Default split: 70% train / 15% val / 15% test
+- Threshold policy: top-k from validation (default `top_k_frac=0.10`)
+- Supported models:
+  - `logistic_regression` (baseline)
+  - `xgboost` (challenger)
+  - `random_forest` (challenger)
+- Promotion policy:
+  - primary KPI: `precision_at_top_k`
+  - recall guardrail: `>= 0.20`
 
-## Train/Validation/Test Strategy
+## 5) Run Options
 
-- Split unit: `deal_id` (never split rows of the same deal across train/val/test).
-- Time logic: deals sorted by earliest `raised_on`.
-- Default split:
-  - 70% deals train
-  - 15% deals validation
-  - 15% deals test
-
-This simulates forward-looking deployment and prevents leakage from repeated deal context.
-
-## Model and Features
-
-Supported models:
-- `logistic_regression` (baseline)
-- `xgboost` (challenger)
-- `random_forest` (challenger)
-
-Feature families:
-- Categorical: deal/product/ops context fields
-- Numeric: age/SLA/time and related numeric fields
-- Text: `query_comments` via TF-IDF (1-2 grams)
-
-Thresholding:
-- Uses validation predictions to choose a top-k threshold (default top 10% risk flags).
-- Also reports metrics at top 5% and top 20% for capacity planning.
-
-## How to Run
-
-### Option 1: Runner script
+### A) Streamlit (Admin / DS)
 
 ```bash
-python scripts/run_training.py path/to/breaks.csv
-```
-
-Or set environment variable:
-
-```bash
-export RECON_INPUT_CSV=path/to/breaks.csv
-python scripts/run_training.py
-```
-
-### Option 2: Streamlit UI
-
-```bash
-python -m streamlit run apps/streamlit_app.py
-```
-
-Role-based app modes:
-
-```bash
-# Admin / DS mode (train + score + run summary)
 APP_MODE=admin python -m streamlit run apps/streamlit_app.py
+```
 
-# Ops mode (score-only UI, champion model locked)
+Capabilities:
+- Train models
+- Compare champion/challengers
+- Score CSVs
+- Download artifacts
+
+### B) Streamlit (Ops)
+
+```bash
 APP_MODE=ops CHAMPION_MODEL_NAME=logistic_regression python -m streamlit run apps/streamlit_app.py
 ```
 
-UI capabilities:
-- Train from uploaded CSV
-- Validate required schema
-- Show run diagnostics (ingestion report, stage timings, collinearity alerts)
-- Save and download artifacts (processed data, metrics, threshold, model)
-- Score new uploaded CSVs with saved or uploaded model artifacts
-- Download scored CSV with `risk_score`, `risk_flag`, and `risk_rank`
+Capabilities:
+- Score-only UI
+- Uses champion model artifacts
 
-### Option 3: Programmatic (recommended for app integration)
-
-```python
-from recon_risk.app import run_training_from_csv
-
-summary = run_training_from_csv(input_csv="data/breaks.csv")
-print(summary)
-```
-
-Custom configuration example:
-
-```python
-from pathlib import Path
-from recon_risk.app import run_training_from_csv
-from recon_risk.config import PathsConfig, TrainingConfig
-
-summary = run_training_from_csv(
-    input_csv="data/breaks.csv",
-    training_config=TrainingConfig(model_name="xgboost", top_k_frac=0.10),
-    paths_config=PathsConfig(
-        data_out=Path("data"),
-        report_out=Path("reports"),
-        model_out=Path("artifacts"),
-    ),
-)
-```
-
-Script model selection:
+### C) Training script
 
 ```bash
-RECON_MODEL_NAME=xgboost python scripts/run_training.py path/to/breaks.csv
+RECON_MODEL_NAME=logistic_regression python scripts/run_training.py path/to/train.csv
+RECON_MODEL_NAME=xgboost python scripts/run_training.py path/to/train.csv
+RECON_MODEL_NAME=random_forest python scripts/run_training.py path/to/train.csv
 ```
 
-If `xgboost` is missing in your environment:
+### D) Scoring API (service-to-service)
 
 ```bash
-pip install xgboost
+CHAMPION_MODEL_NAME=logistic_regression python scripts/run_api.py
 ```
 
-## Outputs
+Health:
 
-After a successful run:
+```bash
+curl http://localhost:8000/health
+```
 
-- `data/recon_breaks_processed.csv`
-  - Cleaned and feature-engineered dataset used for modeling.
+JSON scoring:
 
-- `reports/eda_summary.json`
-  - High-level EDA snapshot (counts, label availability, distributions, null profile).
+```bash
+curl -X POST "http://localhost:8000/v1/score" \
+  -H "Content-Type: application/json" \
+  -d '{"records":[{"deal_id":"D1","deal_type":"OTC","template":"Structured","team":"TSG","break_field":"notional","trade_date":"2025-01-10","raised_on":"2025-01-11","review_due":"2025-01-13","query_comments":"ops follow-up in progress"}]}'
+```
+
+## 6) Key Artifacts
 
 - `artifacts/<model_name>/risk_model.pkl`
-  - Trained sklearn pipeline (preprocessing + model).
-
-- `artifacts/<model_name>/metrics.json`
-  - Validation/test metrics, top-k operating-point reports, and collinearity checks.
-
 - `artifacts/<model_name>/threshold.json`
-  - Saved top-10% threshold for scoring workflows.
-
+- `artifacts/<model_name>/metrics.json`
 - `artifacts/<model_name>/baseline_config.json`
-  - Frozen baseline training policy and feature spec snapshot for fair champion/challenger comparison.
-
 - `artifacts/<model_name>/run_metadata.json`
-  - Run timestamp, input source, known/unknown label counts, and git commit hash (if available).
-
 - `artifacts/model_comparison.json`
-  - Auto-ranked champion/challenger summary using promotion rule:
-    guardrail pass, then precision@top-k, then PR-AUC, then ROC-AUC.
-
+- `data/recon_breaks_processed.csv`
+- `reports/eda_summary.json`
 - `logs/recon_risk.log`
-  - Stage-level application logs (ingestion, preprocess, train/eval, scoring, persistence).
 
-## Notes on Leakage and Safety
+## 7) Docker (API)
 
-- `resolution_via` is used only for labeling, not as an input feature.
+```bash
+docker build -f Dockerfile.api -t recon-risk-api:latest .
+docker run --rm -p 8000:8000 -e CHAMPION_MODEL_NAME=logistic_regression recon-risk-api:latest
+```
+
+## 8) Notes
+
+- `resolution_via` is used for training label derivation only (not as model feature).
 - `resolution_date` is not used as a predictor.
-- Split is deal-grouped and chronological to reduce optimistic bias.
-- Business scope filter: only rows with `is_new_trade = 1` are kept for training/scoring.
-
-## Typical Next Steps
-
-1. Compare champion/challenger runs (`logistic_regression` vs `xgboost`) using identical split/policy settings.
-2. Add model selection logic based on your business objective (for example precision@top-k).
-3. Add scoring service method (`score_dataframe`) for frontend upload flows.
-4. Add explainability layer (feature importance / SHAP) for operational review.
-5. Add unit tests for labeling, split integrity, and preprocessing contracts.
-
-## Troubleshooting
-
-- If training fails due to missing columns:
-  - Ensure required core columns are present and correctly named.
-
-- If no labeled rows are available:
-  - Check `resolution_via` values and mapping categories.
-
-- If date parsing is poor:
-  - Ensure `trade_date`, `raised_on`, `review_due`, `resolution_date` are valid date strings.
-
-- If model quality is unstable:
-  - Verify that `deal_id` granularity and time ordering are correct.
-  - Check label prevalence and unknown-label share in `reports/eda_summary.json`.
+- Scoring output contains `risk_score`, `risk_flag`, `risk_rank` and excludes internal training columns.

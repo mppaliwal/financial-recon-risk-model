@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+logs
+reports
+data
+docs
+tests
+temp_generate_input_csv.py
