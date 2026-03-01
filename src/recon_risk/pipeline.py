@@ -82,12 +82,79 @@ class ReconRiskPipeline:
             x_train[self.model_factory.feature_spec()["numeric"]]
         )
 
-        model = self.model_factory.build()
-        model.fit(x_train, y_train)
+        tuning_report: Dict[str, object] | None = None
+        if self.training_config.model_name in {"xgboost", "random_forest"}:
+            pos = int(y_train.sum())
+            neg = int(len(y_train) - pos)
+            scale_pos_weight = float(neg / max(pos, 1))
 
-        val_prob = model.predict_proba(x_val)[:, 1]
-        threshold = self.evaluator.choose_threshold(val_prob, self.training_config.top_k_frac)
-        test_prob = model.predict_proba(x_test)[:, 1]
+            best = None
+            trials: List[Dict[str, object]] = []
+            if self.training_config.model_name == "xgboost":
+                candidates = self.model_factory.xgboost_candidates()
+            else:
+                candidates = self.model_factory.random_forest_candidates()
+
+            for params in candidates:
+                p = dict(params)
+                if self.training_config.model_name == "xgboost":
+                    p["scale_pos_weight"] = scale_pos_weight
+                candidate = self.model_factory.build(self.training_config.model_name, model_params=p)
+                candidate.fit(x_train, y_train)
+                cand_val_prob = candidate.predict_proba(x_val)[:, 1]
+                cand_thr = self.evaluator.choose_threshold(cand_val_prob, self.training_config.top_k_frac)
+                cand_val_metrics = self.evaluator.metrics(y_val, cand_val_prob, cand_thr)
+                recall_pass = bool(cand_val_metrics["recall"] >= self.training_config.recall_guardrail)
+                candidate_score = (
+                    1 if recall_pass else 0,
+                    float(cand_val_metrics["precision"]),
+                    float(cand_val_metrics["pr_auc"]),
+                    float(cand_val_metrics["recall"]),
+                )
+                trials.append(
+                    {
+                        "params": p,
+                        "validation_metrics": cand_val_metrics,
+                        "recall_guardrail_pass": recall_pass,
+                    }
+                )
+                if best is None or candidate_score > best["score"]:
+                    best = {
+                        "score": candidate_score,
+                        "model": candidate,
+                        "val_prob": cand_val_prob,
+                        "threshold": cand_thr,
+                        "params": p,
+                        "validation_metrics": cand_val_metrics,
+                        "recall_guardrail_pass": recall_pass,
+                    }
+
+            assert best is not None
+            model = best["model"]
+            val_prob = best["val_prob"]
+            threshold = float(best["threshold"])
+            test_prob = model.predict_proba(x_test)[:, 1]
+            tuning_report = {
+                "model_name": self.training_config.model_name,
+                "selected_params": best["params"],
+                "selected_validation_metrics": best["validation_metrics"],
+                "selected_recall_guardrail_pass": best["recall_guardrail_pass"],
+                "candidate_count": len(trials),
+                "candidates": trials,
+            }
+            logger.info(
+                "%s tuning selected params=%s val_precision=%.4f val_recall=%.4f",
+                self.training_config.model_name,
+                best["params"],
+                best["validation_metrics"]["precision"],
+                best["validation_metrics"]["recall"],
+            )
+        else:
+            model = self.model_factory.build(self.training_config.model_name)
+            model.fit(x_train, y_train)
+            val_prob = model.predict_proba(x_val)[:, 1]
+            threshold = self.evaluator.choose_threshold(val_prob, self.training_config.top_k_frac)
+            test_prob = model.predict_proba(x_test)[:, 1]
 
         report: Dict[str, object] = {
             "split_sizes": {
@@ -102,6 +169,7 @@ class ReconRiskPipeline:
             "test_metrics": self.evaluator.metrics(y_test, test_prob, threshold),
         }
         report["promotion_policy"] = {
+            "model_name": self.training_config.model_name,
             "primary_kpi": self.training_config.primary_kpi,
             "top_k_frac": float(self.training_config.top_k_frac),
             "recall_guardrail": float(self.training_config.recall_guardrail),
@@ -116,6 +184,8 @@ class ReconRiskPipeline:
         for frac in self.training_config.test_reporting_topk:
             thr = self.evaluator.choose_threshold(val_prob, frac)
             report[f"test_top_{int(frac * 100)}pct"] = self.evaluator.metrics(y_test, test_prob, thr)
+        if tuning_report is not None:
+            report[f"{self.training_config.model_name}_tuning"] = tuning_report
         return model, report, threshold, collinearity_report
 
     def execute_training_from_csv(self, input_csv: Path) -> Dict[str, object]:
@@ -148,7 +218,12 @@ class ReconRiskPipeline:
         t3 = perf_counter()
         dataset_path = self.store.save_dataset(df)
         eda_path = self.store.save_eda(df)
-        bundle_paths = self.store.save_model_bundle(model, metrics, threshold)
+        bundle_paths = self.store.save_model_bundle(
+            model,
+            metrics,
+            threshold,
+            model_name=self.training_config.model_name,
+        )
         baseline_config_path = self.store.save_baseline_config(
             training_config=self.training_config,
             feature_spec=self.model_factory.feature_spec(),
@@ -159,7 +234,9 @@ class ReconRiskPipeline:
             known_rows=meta.get("n_known_labels", 0),
             unknown_rows=meta.get("n_unknown_labels", 0),
             git_commit=self._git_commit_hash(),
+            model_name=self.training_config.model_name,
         )
+        model_comparison_path = self.store.save_model_comparison()
         t4 = perf_counter()
         logger.info(
             "Artifacts saved dataset=%s metrics=%s",
@@ -184,6 +261,7 @@ class ReconRiskPipeline:
             "threshold_path": str(bundle_paths["threshold_path"]),
             "baseline_config_path": str(baseline_config_path),
             "run_metadata_path": str(run_metadata_path),
+            "model_comparison_path": str(model_comparison_path),
             "test_metrics": metrics["test_metrics"],
             "collinearity_checks": collinearity_report,
             "timings_sec": timings,

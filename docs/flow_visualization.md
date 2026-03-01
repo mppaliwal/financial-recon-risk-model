@@ -15,7 +15,7 @@ flowchart TD
       direction LR
       E["Train Model<br/>`src/recon_risk/pipeline.py`<br/>`_train_evaluate_model(...)`"]:::step
       F["Validation + Metrics + Collinearity Check<br/>`src/recon_risk/evaluation.py` + `src/recon_risk/diagnostics.py`"]:::step
-      G{"Goal Met?<br/>PR-AUC / Precision@Top-k<br/>`artifacts/metrics.json`"}:::decision
+      G{"Goal Met?<br/>PR-AUC / Precision@Top-k<br/>`artifacts/<model_name>/metrics.json`"}:::decision
       H["Tune / Reconfigure<br/>`apps/streamlit_app.py`<br/>`top_k_frac` + settings"]:::step
       E --> F --> G
       G -- "No" --> H --> E
@@ -58,9 +58,9 @@ flowchart LR
     H["Save outputs<br/>`src/recon_risk/artifacts.py`"]:::output
     I["`data/recon_breaks_processed.csv`"]:::output
     J["`reports/eda_summary.json`"]:::output
-    K["`artifacts/risk_model.pkl`"]:::output
-    L["`artifacts/metrics.json`"]:::output
-    M["`artifacts/threshold.json`"]:::output
+    K["`artifacts/<model_name>/risk_model.pkl`"]:::output
+    L["`artifacts/<model_name>/metrics.json`"]:::output
+    M["`artifacts/<model_name>/threshold.json`"]:::output
 
     %% ---------- Edges ----------
     A --> B --> C --> D --> E --> F --> G --> H
@@ -84,8 +84,8 @@ flowchart LR
     A["UI Upload CSV<br/>`apps/streamlit_app.py`"]:::ui
     B["Score service<br/>`src/recon_risk/service.py`<br/>`score_dataframe(...)`"]:::core
     C["Preprocess inference-safe<br/>`src/recon_risk/preprocess.py`"]:::core
-    D["Load model<br/>`artifacts/risk_model.pkl`"]:::output
-    E["Load threshold<br/>`artifacts/threshold.json`"]:::output
+    D["Load model<br/>`artifacts/<model_name>/risk_model.pkl`"]:::output
+    E["Load threshold<br/>`artifacts/<model_name>/threshold.json`"]:::output
     F["Predict `risk_score` + apply `risk_flag` + `risk_rank`"]:::core
     G["Download scored CSV<br/>from Streamlit UI"]:::output
 

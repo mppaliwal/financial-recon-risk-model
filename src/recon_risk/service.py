@@ -77,6 +77,9 @@ def score_dataframe(
     out["risk_score"] = risk_score
     out["risk_flag"] = (out["risk_score"] >= threshold).astype(int)
     out["risk_rank"] = out["risk_score"].rank(method="dense", ascending=False).astype(int)
+    for internal_col in ["y", "label_status"]:
+        if internal_col in out.columns:
+            out = out.drop(columns=[internal_col])
     out = out.sort_values("risk_score", ascending=False).reset_index(drop=True)
 
     summary = {
